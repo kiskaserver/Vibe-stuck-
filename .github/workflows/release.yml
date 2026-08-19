@@ -12,6 +12,11 @@ name: Release
 # The last two are what makes the catalog updatable without reinstalling: an
 # app checks `releases/latest/download/manifest.json`, compares the version
 # with its own, and pulls the database only when there is a newer one.
+#
+# Actions are pinned to full commit SHAs. Flutter comes from a container image
+# on Linux and from a shallow clone on Windows and macOS, so no marketplace
+# action provides the toolchain — a pinning requirement applies transitively,
+# and an action that caches through an unpinned action fails under it.
 
 on:
   push:
@@ -32,6 +37,7 @@ permissions:
 
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
+  FLUTTER_CHANNEL: stable
 
 jobs:
   catalog:
@@ -41,11 +47,11 @@ jobs:
       version: ${{ steps.build.outputs.catalog }}
       app_version: ${{ steps.build.outputs.app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -64,60 +70,46 @@ jobs:
       - name: Tagged artifacts must match the sources
         run: git diff --exit-code -- lib/i18n/categories.dart lib/app_info.dart
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: catalog
           path: dist/*
           if-no-files-found: error
 
-  build:
+  # Android and Linux build inside the Flutter image, which already carries the
+  # Android SDK and its accepted licences.
+  linux:
     name: ${{ matrix.target }}
     needs: catalog
+    runs-on: ubuntu-latest
+    container: ghcr.io/cirruslabs/flutter:stable
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: android
-            os: ubuntu-latest
-          - target: linux
-            os: ubuntu-latest
-          - target: windows
-            os: windows-latest
-          - target: macos
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
+        target: [android, linux]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
 
-      - uses: actions/setup-java@v4
-        if: matrix.target == 'android'
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 libsqlite3-0
+          if [ "${{ matrix.target }}" = "linux" ]; then
+            apt-get install -y -qq --no-install-recommends \
+              clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+          fi
 
       # assets/catalog.db is a build artifact, not a checked-in file. The same
       # sources produce it here as produced the release assets in the catalog
       # job, so what ships inside the app and what ships next to it agree.
       - name: Build the catalog
-        run: python tool/build_catalog.py
+        run: python3 tool/build_catalog.py
 
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Install Linux dependencies
-        if: matrix.target == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config \
-            libgtk-3-dev liblzma-dev libsqlite3-dev
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Generate platform runner
         run: flutter create --project-name vibestack_atlas --platforms=${{ matrix.target }} .
@@ -130,21 +122,77 @@ jobs:
       - run: flutter test
 
       - name: Build
-        shell: bash
-        run: flutter build ${{ matrix.target == 'android' && 'apk' || matrix.target }} --release
+        run: flutter build ${{ matrix.target == 'android' && 'apk' || 'linux' }} --release
 
-      # Each platform leaves one file behind. A directory of loose DLLs or an
-      # .app bundle downloaded as a zip of a zip is awkward to hand to anyone.
-      - name: Package Android
-        if: matrix.target == 'android'
-        shell: bash
-        run: cp build/app/outputs/flutter-apk/app-release.apk
-          "VibeStack-Atlas-${{ needs.catalog.outputs.app_version }}-android.apk"
+      - name: Package
+        run: |
+          set -eu
+          version="${{ needs.catalog.outputs.app_version }}"
+          if [ "${{ matrix.target }}" = "android" ]; then
+            cp build/app/outputs/flutter-apk/app-release.apk \
+               "VibeStack-Atlas-${version}-android.apk"
+          else
+            tar -czf "VibeStack-Atlas-${version}-linux-x64.tar.gz" \
+              -C build/linux/x64/release/bundle .
+          fi
 
-      - name: Package Linux
-        if: matrix.target == 'linux'
-        run: tar -czf "VibeStack-Atlas-${{ needs.catalog.outputs.app_version }}-linux-x64.tar.gz"
-          -C build/linux/x64/release/bundle .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: app-${{ matrix.target }}
+          path: |
+            VibeStack-Atlas-*.apk
+            VibeStack-Atlas-*.tar.gz
+          if-no-files-found: error
+
+  # Windows and macOS cannot use the container, so the SDK is cloned. Slower
+  # than a caching action and beholden to nothing.
+  desktop:
+    name: ${{ matrix.target }}
+    needs: catalog
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows
+            os: windows-latest
+          - target: macos
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Build the catalog
+        run: python tool/build_catalog.py
+
+      - name: Install Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FLUTTER_CHANNEL" \
+            https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Report the toolchain
+        run: flutter --version
+
+      - name: Generate platform runner
+        run: flutter create --project-name vibestack_atlas --platforms=${{ matrix.target }} .
+
+      - name: Configure platform runner
+        run: dart run tool/post_create.dart
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+      - name: Build
+        run: flutter build ${{ matrix.target }} --release
 
       - name: Package Windows
         if: matrix.target == 'windows'
@@ -152,6 +200,7 @@ jobs:
         run: Compress-Archive -Path "build/windows/x64/runner/Release/*"
           -DestinationPath "VibeStack-Atlas-${{ needs.catalog.outputs.app_version }}-windows-x64.zip"
 
+      # A DMG is what macOS users expect; a directory of loose files is not.
       - name: Package macOS
         if: matrix.target == 'macos'
         run: |
@@ -164,26 +213,24 @@ jobs:
             --icon-size 96 --app-drop-link 380 180 "$out" "$app" \
           || hdiutil create -volname "VibeStack Atlas" -srcfolder "$app" -ov -format UDZO "$out"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: app-${{ matrix.target }}
           path: |
-            VibeStack-Atlas-*.apk
-            VibeStack-Atlas-*.tar.gz
             VibeStack-Atlas-*.zip
             VibeStack-Atlas-*.dmg
           if-no-files-found: error
 
   publish:
     name: Publish release
-    needs: [catalog, build]
+    needs: [catalog, linux, desktop]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 

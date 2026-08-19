@@ -4,6 +4,12 @@ name: CI
 #
 # Two independent gates. The catalog gate needs only Python, so a data-only
 # change gets an answer in seconds; the app gate needs the Flutter SDK.
+#
+# Every action is pinned to a full commit SHA. Repositories can require that,
+# and the requirement is transitive: an action that calls an unpinned action
+# is rejected too. That is why the Flutter SDK comes from a container image
+# here rather than from a marketplace action — and the same image runs this
+# pipeline on Codeberg, so both CIs test the app in one environment.
 
 on:
   pull_request:
@@ -23,9 +29,9 @@ jobs:
     name: Catalog
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -49,32 +55,32 @@ jobs:
   app:
     name: Analyze and test
     runs-on: ubuntu-latest
+    # Flutter and the Android SDK come preinstalled; nothing here installs a
+    # toolchain at run time.
+    container: ghcr.io/cirruslabs/flutter:stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # python3 builds the catalog — assets/catalog.db is generated, not
+      # checked out, and nothing below works without it. libsqlite3-0 is what
+      # `flutter test` opens it with: the tests run on the host VM, where the
+      # native library comes from the system rather than from
+      # sqlite3_flutter_libs, and without it they would skip themselves
+      # instead of failing, which is a silently empty gate.
+      - name: Install Python and native SQLite
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 libsqlite3-0
 
-      # assets/catalog.db is a build artifact, so it is built rather than
-      # checked out. Nothing below can run without it: it is the catalog.
       - name: Build the catalog
-        run: python tool/build_catalog.py
+        run: python3 tool/build_catalog.py
 
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      # `flutter test` runs on the host VM, where the native SQLite comes from
-      # the system rather than from sqlite3_flutter_libs. Without it the
-      # database tests skip themselves instead of failing, which would quietly
-      # remove the catalog contract from CI.
-      - name: Install native SQLite
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-0 libsqlite3-dev
+      # The container clones as a different user than the checkout ran as.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # No platform runner is committed; it is generated from the Flutter
-      # version on the runner instead of frozen in the repository.
+      # version in the image instead of frozen in the repository.
       - name: Generate platform runner
         run: flutter create --project-name vibestack_atlas --platforms=linux .
 
